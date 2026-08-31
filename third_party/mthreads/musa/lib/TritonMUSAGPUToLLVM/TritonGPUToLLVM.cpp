@@ -1,9 +1,11 @@
+#include "TritonMUSACommon/BarrierUtils.h"
 #include "TritonMUSACommon/MMAOperandUtils.h"
 #include "TritonMUSACommon/SqmmaAttrUtils.h"
 #include "TritonMUSAGPUToLLVM/Allocation.h"
 #include "TritonMUSAGPUToLLVM/Passes.h"
 #include "TritonMUSAGPUToLLVM/TargetInfo.h"
 #include "TritonMUSAGPUToLLVM/Utility.h"
+#include "llvm/ADT/StringMap.h"
 #ifdef __TLE__
 #include "Conversion/MUSATLEToLLVM/LocalPointersOpToLLVM.h"
 #include "Dialect/MUSATLE/IR/Dialect.h"
@@ -425,9 +427,39 @@ struct ConvertTritonMUSAGPUToLLVM
     RewritePatternSet funcPatterns(context);
     mlir::triton::populateFuncOpConversionPattern(
         typeConverter, funcPatterns, targetInfo, patternBenefitDefault);
+
+    // Hardware barrier ids are handed out per function and the watermark lives
+    // on the function op, so it has to survive this conversion. Passes that run
+    // afterwards -- warp-specialize lowering reserves ids for its partition
+    // rendezvous -- otherwise restart from zero against a fresh llvm.func and
+    // hand out ids the pipe is already using, which corrupts both. The
+    // watermark stays per function (keyed by symbol name); hoisting it to the
+    // module would leak ids across unrelated kernels.
+    llvm::StringMap<int32_t> barrierWatermarks;
+    mod.walk([&](triton::FuncOp func) {
+      int32_t watermark = 0;
+      for (auto name :
+           {triton::musa::kNextBarrierIdAttr, triton::musa::kMaxBarrierIdAttr})
+        if (auto attr = func->getAttrOfType<IntegerAttr>(name))
+          watermark = std::max(watermark, static_cast<int32_t>(attr.getInt()));
+      if (watermark > 0)
+        barrierWatermarks[func.getName()] = watermark;
+    });
+
     if (failed(
             applyPartialConversion(mod, funcTarget, std::move(funcPatterns))))
       return signalPassFailure();
+
+    if (!barrierWatermarks.empty()) {
+      mod.walk([&](LLVM::LLVMFuncOp func) {
+        auto it = barrierWatermarks.find(func.getName());
+        if (it == barrierWatermarks.end())
+          return;
+        auto attr = IntegerAttr::get(IntegerType::get(context, 32), it->second);
+        func->setAttr(triton::musa::kNextBarrierIdAttr, attr);
+        func->setAttr(triton::musa::kMaxBarrierIdAttr, attr);
+      });
+    }
 
     initSharedMemory(typeConverter, targetInfo);
     ModuleAxisInfoAnalysis axisInfoAnalysis(mod);

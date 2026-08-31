@@ -920,6 +920,11 @@ class MUSABackend(BaseBackend):
             if _should_apply_llvm_compat(llc_major):
                 ir_text = _llvm_compat(ir_text)
         ir_text = _rewrite_llvm_scmp_ucmp_to_icmp(ir_text)
+        # The TLE warp-specialize lowering emits calls to a plain extern
+        # shim because the in-process LLVM does not know
+        # `llvm.musa.lma.wait`; the MUSA llc does, so rename it here, just
+        # before codegen.
+        ir_text = ir_text.replace("@__musa_shim_lma_wait", "@llvm.musa.lma.wait")
 
         if knobs.musa.dump_llir:
             print("// -----// MUSA LLVMIR Dump //----- //")
