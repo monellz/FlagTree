@@ -137,6 +137,21 @@ def TritonGPUPartitionLoops : Pass<"tritongpu-partition-loops", "mlir::ModuleOp"
   ];
 }
 
+def TritonGPUApplyPartitionWarps : Pass<"tritongpu-apply-partition-warps", "mlir::ModuleOp"> {
+  let summary = "Apply the partition warp counts a TLE kernel declared";
+  let description = [{
+    A TLE kernel names each partition's warp count in the frontend, but the
+    conversion to TritonGPU can only assign layouts at a single width. The
+    declared counts are parked on `ttg.warp_specialize` during conversion and
+    applied by this pass, which re-runs layout assignment on each narrowed
+    partition body -- the same path the automatic warp optimizer takes.
+  }];
+  let dependentDialects = [
+    "mlir::triton::gpu::TritonGPUDialect",
+    "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect"
+  ];
+}
+
 def TritonGPUOptimizePartitionWarps : Pass<"tritongpu-optimize-partition-warps", "mlir::ModuleOp"> {
   let summary = "optimize the number of warps assigned to partitions";
 

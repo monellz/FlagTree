@@ -761,6 +761,10 @@ class MUSABackend(BaseBackend):
         emu_tf32 = capability >= 31
 
         passes.ttir.add_convert_to_ttgpuir(pm, f"musa:{arch}", opt.num_warps, opt.warp_size, opt.num_ctas)
+        # TLE partitions declare their own warp counts, but the conversion above
+        # sizes every layout by opt.num_warps; this re-runs layout assignment on
+        # any partition body whose declared count differs.
+        passes.ttgpuir.add_apply_partition_warps(pm)
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emu_tf32)
         passes.ttgpuir.add_remove_layout_conversions(pm)

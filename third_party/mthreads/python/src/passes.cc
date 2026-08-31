@@ -95,6 +95,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
                      createTritonGPUCoalesceAsyncCopy);
   ADD_PASS_WRAPPER_0("add_concurrency_sanitizer",
                      createTritonInstrumentConcurrencySanitizer);
+  ADD_PASS_WRAPPER_0("add_apply_partition_warps",
+                     createTritonGPUApplyPartitionWarps);
   ADD_PASS_WRAPPER_0("add_optimize_partition_warps",
                      createTritonGPUOptimizePartitionWarps);
 }

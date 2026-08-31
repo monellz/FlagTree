@@ -30,6 +30,51 @@ using namespace mlir;
 using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 
+#ifdef __TLE__
+// TLE declares each partition's warp count up front, but this conversion sizes
+// every tensor layout by the module's `ttg.num-warps`, and each layout is then
+// verified against the warp count of its own region -- so a partition whose
+// declared count differs from the module width cannot compile if its body
+// carries tensor computation. Reroute exactly those partitions: convert them
+// at module width here and let `tritongpu-apply-partition-warps` re-run layout
+// assignment at the declared width afterwards. Tensor-free partitions (TME
+// copy loops and other scalar/descriptor code) have no layouts to verify;
+// they have always converted at module width while running at their declared
+// width, so they are left untouched.
+static constexpr llvm::StringLiteral kDeclaredPartitionWarps =
+    "musa_tle.declared_partition_num_warps";
+
+static bool partitionCarriesTensors(Region *region) {
+  auto isTensor = [](Type ty) { return isa<RankedTensorType>(ty); };
+  WalkResult result = region->walk([&](Operation *op) {
+    if (llvm::any_of(op->getResultTypes(), isTensor) ||
+        llvm::any_of(op->getOperandTypes(), isTensor))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted();
+}
+
+static void parkDeclaredPartitionWarps(ModuleOp mod, int moduleWarps) {
+  mod.walk([&](triton::gpu::WarpSpecializeOp ws) {
+    SmallVector<int32_t> declared(ws.getPartitionNumWarps());
+    SmallVector<int32_t> converted = declared;
+    bool parkedAny = false;
+    for (auto [i, region] : llvm::enumerate(ws.getPartitionRegions())) {
+      if (declared[i] == moduleWarps || !partitionCarriesTensors(region))
+        continue;
+      converted[i] = moduleWarps;
+      parkedAny = true;
+    }
+    if (!parkedAny)
+      return;
+    Builder b(ws.getContext());
+    ws->setAttr(kDeclaredPartitionWarps, b.getDenseI32ArrayAttr(declared));
+    ws.setPartitionNumWarps(converted);
+  });
+}
+#endif // __TLE__
+
 // pass named attrs (e.g., tt.contiguity) from Triton to Triton
 static void addNamedAttrs(Operation *op, DictionaryAttr dictAttrs) {
   for (const NamedAttribute attr : dictAttrs.getValue())
@@ -1576,6 +1621,7 @@ public:
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
 #ifdef __TLE__
+    parkDeclaredPartitionWarps(mod, numWarps);
     if (failed(applyMusaTleEncodingHints(mod)))
       return signalPassFailure();
     if (failed(applyPartialConversion(mod, target, std::move(patterns))))

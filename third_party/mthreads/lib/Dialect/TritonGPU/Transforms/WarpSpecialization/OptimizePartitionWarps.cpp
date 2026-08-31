@@ -279,6 +279,7 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
 
 namespace mlir::triton::gpu {
 #define GEN_PASS_DEF_TRITONGPUOPTIMIZEPARTITIONWARPS
+#define GEN_PASS_DEF_TRITONGPUAPPLYPARTITIONWARPS
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h.inc"
 } // namespace mlir::triton::gpu
 
@@ -314,5 +315,120 @@ void OptimizePartitionWarps::runOnOperation() {
     if (failed(optimizePartitionNumWarps(axisInfo, wsOp, runPipelineFn))) {
       return signalPassFailure();
     }
+  }
+}
+
+// `relayoutWarps` finishes by running `tritongpu-accelerate-matmul`, which asks
+// for the NVIDIA compute capability and asserts the target is `cuda:`. The
+// mthreads pipeline runs its own `tritonmusa-accelerate-matmul` over the whole
+// module later anyway, so this variant stops after the layout work.
+static LogicalResult relayoutWarpsPortable(ModuleAxisInfoAnalysis &axisInfo,
+                                           Region *partition, int prevNumWarps,
+                                           int newNumWarps,
+                                           RunPipelineFn runPipeline) {
+  OwningOpRef<ModuleOp> container =
+      takeIntoFunction(axisInfo, partition, prevNumWarps);
+
+  mlir::AttrTypeReplacer replacer;
+  replacer.addReplacement(
+      [](RankedTensorType ty) { return ty.cloneWithEncoding({}); });
+  replacer.addReplacement([](TensorDescType ty) -> std::pair<Type, WalkResult> {
+    return {ty, WalkResult::skip()};
+  });
+  replacer.recursivelyReplaceElementsIn(*container, /*replaceAttrs=*/false,
+                                        /*replaceLocs=*/false,
+                                        /*replaceTypes=*/true);
+
+  ModuleOp mod = axisInfo.getModuleOp();
+  auto target = mod->getAttrOfType<StringAttr>(AttrTargetName);
+  if (!target)
+    return mlir::emitError(mod.getLoc(), "module missing target specification");
+  int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(mod);
+  int numCTAs = TritonGPUDialect::getNumCTAs(mod);
+
+  OpPassManager pm;
+  pm.addPass(
+      createConvertTritonToTritonGPU({target.str(), newNumWarps, threadsPerWarp,
+                                      numCTAs, /*enableSourceRemat=*/true}));
+  pm.addPass(createRelayoutTritonGPU());
+  if (failed(runPipeline(pm, *container)))
+    return failure();
+  container->walk([](UnrealizedConversionCastOp op) {
+    op.getResult(0).replaceAllUsesWith(op.getOperand(0));
+    op.erase();
+  });
+
+  pm.clear();
+  pm.addPass(createTritonGPUCoalesce());
+  pm.addPass(createTritonGPURemoveLayoutConversions());
+  pm.addPass(createTritonGPUOptimizeThreadLocality());
+  pm.addPass(createTritonGPURemoveLayoutConversions());
+  if (failed(runPipeline(pm, *container)))
+    return failure();
+
+  extractPartitionBody(std::move(container), partition);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// ApplyPartitionWarps
+//===----------------------------------------------------------------------===//
+
+// TLE kernels declare each partition's warp count in the frontend, but the
+// conversion to TritonGPU can only produce layouts at one width, so the
+// declared counts are parked on the op and applied here -- by the same
+// `relayoutWarps` that the automatic pass uses, which re-runs layout
+// assignment on the partition body at the narrower width.
+static constexpr llvm::StringLiteral kDeclaredPartitionWarps =
+    "musa_tle.declared_partition_num_warps";
+
+namespace {
+struct ApplyPartitionWarps
+    : triton::gpu::impl::TritonGPUApplyPartitionWarpsBase<ApplyPartitionWarps> {
+  using TritonGPUApplyPartitionWarpsBase::TritonGPUApplyPartitionWarpsBase;
+
+  void runOnOperation() override;
+};
+} // namespace
+
+void ApplyPartitionWarps::runOnOperation() {
+  SmallVector<WarpSpecializeOp> wsOps;
+  getOperation().walk([&](WarpSpecializeOp wsOp) {
+    if (wsOp->hasAttr(kDeclaredPartitionWarps))
+      wsOps.push_back(wsOp);
+  });
+  if (wsOps.empty())
+    return;
+
+  ModuleAxisInfoAnalysis axisInfo(getOperation());
+  auto runPipelineFn = [&](OpPassManager &pm, ModuleOp container) {
+    getOperation().push_back(container);
+    auto remove = llvm::make_scope_exit([&] { container->remove(); });
+    return runPipeline(pm, container);
+  };
+
+  for (WarpSpecializeOp wsOp : wsOps) {
+    auto declared =
+        wsOp->getAttrOfType<DenseI32ArrayAttr>(kDeclaredPartitionWarps);
+    wsOp->removeAttr(kDeclaredPartitionWarps);
+    SmallVector<int32_t> current(wsOp.getPartitionNumWarps());
+    if (declared.size() != static_cast<int64_t>(current.size())) {
+      wsOp.emitOpError("declared partition warp counts do not match the op");
+      return signalPassFailure();
+    }
+    for (auto [index, region] : llvm::enumerate(wsOp.getPartitionRegions())) {
+      int32_t want = declared[index];
+      if (want == current[index])
+        continue;
+      // The relayout handles widening and narrowing alike.
+      if (failed(relayoutWarpsPortable(axisInfo, region, current[index], want,
+                                       runPipelineFn))) {
+        wsOp.emitOpError("failed to re-layout partition ")
+            << index << " for " << want << " warps";
+        return signalPassFailure();
+      }
+      current[index] = want;
+    }
+    wsOp.setPartitionNumWarps(current);
   }
 }
